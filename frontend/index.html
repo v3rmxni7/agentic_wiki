@@ -1,0 +1,248 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Agentic Wiki</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+<style>
+  body { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  .trace-agent { transition: background 0.2s ease; }
+  .trace-agent.active { background: #fef3c7; }
+  .trace-agent.done { background: #dcfce7; }
+  .trace-agent.error { background: #fee2e2; }
+  .prose h2 { font-size: 1.1rem; font-weight: 600; margin-top: 1rem; margin-bottom: 0.25rem; color: #0f172a; }
+  .prose ul { list-style: disc; margin-left: 1.25rem; }
+  .prose p { margin: 0.4rem 0; }
+  .prose code { background: #f1f5f9; padding: 1px 4px; border-radius: 3px; font-size: 0.9em; }
+  .pill { font-size: 10px; padding: 1px 6px; border-radius: 9999px; background: #e2e8f0; color: #334155; }
+  .pill.cov-stub { background: #fee2e2; color: #991b1b; }
+  .pill.cov-partial { background: #fef3c7; color: #92400e; }
+  .pill.cov-comprehensive { background: #dcfce7; color: #166534; }
+  .pill.cov-missing { background: #e2e8f0; color: #475569; }
+  #graph { height: 320px; background: #f8fafc; border-radius: 8px; }
+</style>
+</head>
+<body class="bg-slate-50 text-slate-800 h-screen overflow-hidden">
+
+<div class="flex flex-col h-full">
+  <header class="bg-white border-b px-4 py-3 flex items-center justify-between">
+    <div>
+      <div class="text-lg font-semibold">Agentic Wiki</div>
+      <div class="text-xs text-slate-500">Six agents build a markdown wiki. Intent-driven workflow, live wikilinks, derived confidence.</div>
+    </div>
+    <div class="text-xs text-slate-400" id="kb-stats">loading…</div>
+  </header>
+
+  <main class="grid grid-cols-12 gap-3 p-3 flex-1 overflow-hidden">
+    <!-- LEFT: query + trace -->
+    <section class="col-span-4 flex flex-col gap-3 overflow-hidden">
+      <div class="bg-white border rounded-lg p-3">
+        <label class="block text-xs font-medium text-slate-500 mb-1">Ask anything</label>
+        <form id="query-form" class="flex gap-2">
+          <input id="query-input" type="text" class="flex-1 border rounded px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300"
+                 placeholder='e.g. "Explain PPO" or "Compare BPE vs WordPiece"' />
+          <button class="bg-indigo-600 text-white text-sm px-3 py-1.5 rounded hover:bg-indigo-700" type="submit">Run</button>
+        </form>
+        <div class="mt-2 flex flex-wrap gap-1 text-xs">
+          <button class="example-q pill hover:bg-slate-300" data-q="Explain PPO">Explain PPO</button>
+          <button class="example-q pill hover:bg-slate-300" data-q="Compare BPE vs WordPiece">Compare BPE vs WordPiece</button>
+          <button class="example-q pill hover:bg-slate-300" data-q="What is KV cache?">What is KV cache?</button>
+        </div>
+      </div>
+
+      <div class="bg-white border rounded-lg p-3 overflow-auto flex-1">
+        <div class="text-xs font-medium text-slate-500 mb-2">Agent trace</div>
+        <div id="trace" class="space-y-1 text-sm"></div>
+      </div>
+    </section>
+
+    <!-- CENTER: note viewer -->
+    <section class="col-span-5 flex flex-col overflow-hidden">
+      <div class="bg-white border rounded-lg p-3 flex-1 overflow-hidden flex flex-col">
+        <div class="flex items-baseline justify-between">
+          <div>
+            <div id="note-title" class="text-base font-semibold">Select a note</div>
+            <div id="note-meta" class="text-xs text-slate-500"></div>
+          </div>
+          <div id="note-pills" class="flex gap-1"></div>
+        </div>
+        <hr class="my-2" />
+        <div id="note-answer" class="bg-indigo-50 border border-indigo-100 text-sm p-2 rounded mb-2 hidden"></div>
+        <article id="note-body" class="prose text-sm overflow-auto flex-1"></article>
+      </div>
+    </section>
+
+    <!-- RIGHT: graph + notes list -->
+    <section class="col-span-3 flex flex-col gap-3 overflow-hidden">
+      <div class="bg-white border rounded-lg p-3">
+        <div class="text-xs font-medium text-slate-500 mb-1">Knowledge graph</div>
+        <div id="graph"></div>
+      </div>
+      <div class="bg-white border rounded-lg p-3 overflow-auto flex-1">
+        <div class="text-xs font-medium text-slate-500 mb-2">Notes</div>
+        <ul id="notes-list" class="text-sm space-y-1"></ul>
+      </div>
+    </section>
+  </main>
+</div>
+
+<script>
+const $ = (s) => document.querySelector(s);
+const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = text; return e; };
+
+let graphNetwork = null;
+
+async function loadNotes(selectSlug) {
+  const res = await fetch("/api/notes").then(r => r.json());
+  const list = $("#notes-list");
+  list.innerHTML = "";
+  const notes = res.notes.sort((a,b) => (b.revision||0) - (a.revision||0));
+  for (const n of notes) {
+    const li = el("li", "flex items-center justify-between gap-2 cursor-pointer hover:bg-slate-100 rounded px-2 py-1");
+    const left = el("div", "flex-1 min-w-0");
+    const title = el("div", "truncate font-medium", n.title);
+    const sub = el("div", "text-xs text-slate-500 truncate", `${n.slug}.md · conf ${n.confidence} · ↪${n.links_out} ↩${n.links_in}`);
+    left.append(title, sub);
+    const pill = el("span", `pill cov-${n.coverage}`, n.coverage);
+    li.append(left, pill);
+    li.onclick = () => loadNote(n.slug);
+    list.appendChild(li);
+  }
+  $("#kb-stats").textContent = `${notes.length} notes · ${notes.reduce((a,n)=>a+n.links_out,0)} links`;
+  if (selectSlug) loadNote(selectSlug);
+  await loadGraph();
+}
+
+async function loadNote(slug) {
+  const res = await fetch(`/api/note/${slug}`).then(r => r.json());
+  $("#note-title").textContent = res.meta.title;
+  $("#note-meta").textContent = `${slug}.md · created ${res.meta.created||"?"} · updated ${res.meta.updated||"?"} · rev ${res.meta.revision}`;
+  const pills = $("#note-pills");
+  pills.innerHTML = "";
+  pills.append(
+    el("span", `pill cov-${res.meta.coverage}`, res.meta.coverage),
+    el("span", "pill", `conf ${res.meta.confidence}`),
+    el("span", "pill", `↪${res.meta.links_out}`),
+    el("span", "pill", `↩${res.meta.links_in}`),
+    el("span", "pill", res.meta.validator_passed ? "✓ validated" : "⚠ unvalidated"),
+  );
+  // render body, turn [[Title]] into clickable links
+  const notesRes = await fetch("/api/notes").then(r => r.json());
+  const titleToSlug = {};
+  for (const n of notesRes.notes) titleToSlug[n.title.toLowerCase()] = n.slug;
+  const withLinks = res.body.replace(/\[\[([^\]]+)\]\]/g, (_, t) => {
+    const s = titleToSlug[t.toLowerCase()] || t.toLowerCase().replace(/\s+/g, "-");
+    return `<a class="text-indigo-600 hover:underline" href="#" data-slug="${s}">${t}</a>`;
+  });
+  $("#note-body").innerHTML = marked.parse(withLinks);
+  $("#note-body").querySelectorAll("a[data-slug]").forEach(a => {
+    a.onclick = (e) => { e.preventDefault(); loadNote(a.dataset.slug); };
+  });
+}
+
+async function loadGraph() {
+  const g = await fetch("/api/graph").then(r => r.json());
+  const nodes = g.nodes.map(n => ({
+    id: n.id,
+    label: n.label,
+    color: n.missing ? "#e5e7eb" : (n.coverage === "comprehensive" ? "#86efac" : n.coverage === "partial" ? "#fde68a" : "#fca5a5"),
+    shape: "dot",
+    size: 10 + Math.min((n.links_in || 0) * 4, 20),
+    font: { size: 12 },
+  }));
+  const edges = g.edges.map(e => ({ from: e.from, to: e.to, arrows: "to", color: { color: "#cbd5e1" } }));
+  if (graphNetwork) graphNetwork.destroy();
+  graphNetwork = new vis.Network(document.getElementById("graph"), { nodes, edges }, {
+    physics: { stabilization: true, barnesHut: { gravitationalConstant: -3000 } },
+    interaction: { hover: true },
+  });
+  graphNetwork.on("click", (p) => { if (p.nodes && p.nodes[0]) loadNote(p.nodes[0]); });
+}
+
+function agentRow(name) {
+  const row = el("div", "trace-agent border rounded px-2 py-1 flex items-start gap-2");
+  row.dataset.agent = name;
+  row.append(
+    el("div", "w-20 text-xs font-semibold text-slate-600", name),
+    el("div", "flex-1 text-xs text-slate-700 whitespace-pre-wrap", "…"),
+  );
+  return row;
+}
+
+function ensureAgentRow(name) {
+  let row = document.querySelector(`.trace-agent[data-agent="${name}"]`);
+  if (!row) {
+    row = agentRow(name);
+    $("#trace").appendChild(row);
+  }
+  return row;
+}
+
+function runQuery(q) {
+  $("#trace").innerHTML = "";
+  $("#note-answer").classList.add("hidden");
+  const es = new EventSource("/api/query_stream?query=" + encodeURIComponent(q));
+  const agentsSeen = new Set();
+  es.addEventListener("trace", (ev) => {
+    const e = JSON.parse(ev.data);
+    const row = ensureAgentRow(e.agent);
+    agentsSeen.add(e.agent);
+    const body = row.children[1];
+    if (e.phase === "start") {
+      row.classList.add("active"); row.classList.remove("done", "error");
+      body.textContent = e.detail || "running…";
+    } else if (e.phase === "end") {
+      row.classList.remove("active"); row.classList.add("done");
+      body.textContent = e.detail || "done";
+      if (e.data && Object.keys(e.data).length) {
+        const extra = el("div", "text-[11px] text-slate-500 mt-1", JSON.stringify(e.data));
+        body.appendChild(extra);
+      }
+    } else if (e.phase === "error") {
+      row.classList.add("error"); row.classList.remove("active");
+      body.textContent = "error: " + (e.detail || "");
+    }
+  });
+  es.addEventListener("result", (ev) => {
+    const r = JSON.parse(ev.data);
+    const ans = $("#note-answer");
+    ans.classList.remove("hidden");
+    ans.innerHTML = marked.parse(r.answer || "");
+    // select the first touched note
+    if (r.notes_touched && r.notes_touched.length) {
+      loadNotes(r.notes_touched[0]);
+    } else {
+      loadNotes();
+    }
+  });
+  es.addEventListener("error", (ev) => {
+    try {
+      const e = JSON.parse(ev.data);
+      const row = ensureAgentRow("error");
+      row.classList.add("error");
+      row.children[1].textContent = e.message;
+    } catch {}
+  });
+  es.addEventListener("done", () => es.close());
+}
+
+$("#query-form").addEventListener("submit", (e) => {
+  e.preventDefault();
+  const q = $("#query-input").value.trim();
+  if (q) runQuery(q);
+});
+
+document.querySelectorAll(".example-q").forEach(b => {
+  b.onclick = () => {
+    $("#query-input").value = b.dataset.q;
+    runQuery(b.dataset.q);
+  };
+});
+
+loadNotes();
+</script>
+</body>
+</html>
